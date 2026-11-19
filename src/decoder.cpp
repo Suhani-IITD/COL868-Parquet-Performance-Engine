@@ -557,6 +557,8 @@ void decode_chunk(std::span<const uint8_t> bytes, const Chunk& chunk,
         value_width = 4;
     }
     ChunkDecodeState state;
+    // PLAIN pages must fill the mask too; chunks without a dictionary page never set this otherwise.
+    state.predicate_active = options.predicate.active && !options.predicate.match_mask.empty();
     size_t position = 0;
     while (position < bytes.size()) {
         // Locate this page's header/body without copying the underlying chunk bytes.
