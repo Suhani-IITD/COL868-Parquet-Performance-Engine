@@ -15,6 +15,8 @@ inline constexpr size_t max_result_rows = 100000;
 struct ScanContext {
     ReusableBuffer<uint8_t> raw;
     std::vector<ReusableBuffer<int64_t>> columns;
+    ReusableBuffer<uint8_t> predicate_mask;
+    bool mask_valid = false;
 };
 struct ScanOptions {
     bool include_rows = false;

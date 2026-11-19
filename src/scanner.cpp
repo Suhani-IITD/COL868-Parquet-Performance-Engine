@@ -100,7 +100,8 @@ void add_decode_counts(DecodeCounts& total, const DecodeCounts& chunk) {
 
 // Read/decode all required columns of one retained group and return their value buffers.
 DecodedColumns read_group_columns(FileReader& file, const Metadata& metadata,
-                                   const GroupPlan& group, const ScanOptions& options, ScanContext& context, ScanResult& result) {
+                                   const GroupPlan& group, const ColumnSelection& selection,
+                                   const ScanOptions& options, ScanContext& context, ScanResult& result) {
     if (group.chunks.empty()) {
         throw std::runtime_error("scan: retained group has no required chunks");
     }
@@ -145,6 +146,13 @@ DecodedColumns read_group_columns(FileReader& file, const Metadata& metadata,
             auto decoding = options.decoding;
             decoding.timing = nullptr;
             if (options.timing && options.diagnostics) { decoding.timing = &result.timing; }
+            if (result.plan.query.predicate && column == selection.predicate_index && !selection.empty) {
+                decoding.predicate.active = true;
+                decoding.predicate.lower = selection.lower;
+                decoding.predicate.upper = selection.upper;
+                decoding.predicate.match_mask = context.predicate_mask.prepare(static_cast<size_t>(row_count));
+                context.mask_valid = true;
+            }
             decode_chunk(bytes, chunk, columns.back(), decoded, decoding);
             add_decode_counts(result.decoded, decoded);
             if (options.diagnostics) { result.chunks.push_back({group.row_group, range.column, decoded}); }
@@ -184,7 +192,7 @@ void append_result_row(const DecodedColumns& columns, size_t row,
 
 // Count matches and optionally hash/materialize projected rows from this decoded group.
 void filter_group_rows(const DecodedColumns& columns, const ColumnSelection& selection,
-                       const ScanOptions& options, ValueDigest* digest,
+                       const ScanOptions& options, ScanContext& context, ValueDigest* digest,
                        std::vector<int64_t>& digest_row, size_t& result_cells, ScanResult& result) {
     const auto& predicate = result.plan.query.predicate;
     const auto started = start_timer(options.timing);
@@ -192,10 +200,20 @@ void filter_group_rows(const DecodedColumns& columns, const ColumnSelection& sel
         add_elapsed(options.timing, started, result.timing.filter_ms);
         return;
     }
+    const bool use_mask = context.mask_valid;
+    const auto* mask_ptr = use_mask ? context.predicate_mask.data() : nullptr;
+    const size_t n_rows = columns.front().size();
+
     // Count-only scans avoid optional-bound, digest and output-mode branches per row.
     if (!digest && !options.include_rows) {
         if (!predicate) {
-            result.matched_rows += columns.front().size();
+            result.matched_rows += n_rows;
+        } else if (use_mask) {
+            uint64_t matches = 0;
+            for (size_t i = 0; i < n_rows; ++i) {
+                matches += mask_ptr[i];
+            }
+            result.matched_rows += matches;
         } else {
             uint64_t matches = 0;
             for (const auto value : columns[selection.predicate_index]) {
@@ -206,9 +224,13 @@ void filter_group_rows(const DecodedColumns& columns, const ColumnSelection& sel
         add_elapsed(options.timing, started, result.timing.filter_ms);
         return;
     }
-    for (size_t row = 0; row < columns.front().size(); ++row) {
-        if (predicate && !matches_interval(columns[selection.predicate_index][row], selection)) {
-            continue;
+    for (size_t row = 0; row < n_rows; ++row) {
+        if (predicate) {
+            if (use_mask) {
+                if (!mask_ptr[row]) { continue; }
+            } else if (!matches_interval(columns[selection.predicate_index][row], selection)) {
+                continue;
+            }
         }
         ++result.matched_rows;
         if (digest) {
@@ -265,8 +287,9 @@ ScanResult scan(FileReader& file, const Metadata& metadata, const Query& query, 
         if (!group.retained) {
             continue;
         }
-        const auto columns = read_group_columns(file, metadata, group, options, *context, result);
-        filter_group_rows(columns, selection, options, digest.get(), digest_row, result_cells, result);
+        context->mask_valid = false;
+        const auto columns = read_group_columns(file, metadata, group, selection, options, *context, result);
+        filter_group_rows(columns, selection, options, *context, digest.get(), digest_row, result_cells, result);
         // The views expire here; context storage is overwritten by the next group.
     }
     finish_scan_io(file, initial_bytes, initial_calls, result);

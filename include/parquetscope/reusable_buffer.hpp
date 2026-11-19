@@ -17,6 +17,8 @@ public:
     }
     // Return retained capacity, used to enforce scan workspace limits.
     size_t capacity() const { return capacity_; }
+    T* data() { return storage_.get(); }
+    const T* data() const { return storage_.get(); }
 private:
     std::unique_ptr<T[]> storage_;
     size_t capacity_ = 0;

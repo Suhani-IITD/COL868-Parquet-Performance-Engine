@@ -181,7 +181,9 @@ template<bool Indices>
 size_t decode_rle_run(std::span<const uint8_t> bytes, size_t& position,
                       uint8_t bit_width, uint64_t repetitions,
                       std::span<const int64_t> dictionary, size_t dictionary_size,
-                      std::span<std::conditional_t<Indices, uint32_t, int64_t>> output) {
+                      std::span<std::conditional_t<Indices, uint32_t, int64_t>> output,
+                      std::span<const uint8_t> dict_matches = {},
+                      std::span<uint8_t> match_mask = {}) {
     if (repetitions > output.size()) {
         throw std::runtime_error("decode: RLE run exceeds page value count");
     }
@@ -199,12 +201,16 @@ size_t decode_rle_run(std::span<const uint8_t> bytes, size_t& position,
     if (dictionary_id >= dictionary_size) {
         throw std::runtime_error("decode: dictionary ID out of range");
     }
+    const auto reps = static_cast<size_t>(repetitions);
     if constexpr (Indices) {
-        std::fill_n(output.begin(), static_cast<size_t>(repetitions), dictionary_id);
+        std::fill_n(output.begin(), reps, dictionary_id);
     } else {
-        std::fill_n(output.begin(), static_cast<size_t>(repetitions), dictionary[dictionary_id]);
+        std::fill_n(output.begin(), reps, dictionary[dictionary_id]);
     }
-    return static_cast<size_t>(repetitions);
+    if (!match_mask.empty() && dictionary_id < dict_matches.size()) {
+        std::fill_n(match_mask.begin(), reps, dict_matches[dictionary_id]);
+    }
+    return reps;
 }
 
 // Expand groups of eight packed IDs; allow at most seven padding values at page end.
@@ -212,7 +218,9 @@ template<bool Indices, bool Naive>
 size_t decode_bit_packed_run(std::span<const uint8_t> bytes, size_t& position,
                              uint8_t bit_width, uint64_t groups,
                              std::span<const int64_t> dictionary, size_t dictionary_size,
-                             std::span<std::conditional_t<Indices, uint32_t, int64_t>> output) {
+                             std::span<std::conditional_t<Indices, uint32_t, int64_t>> output,
+                             std::span<const uint8_t> dict_matches = {},
+                             std::span<uint8_t> match_mask = {}) {
     const uint64_t run_values = groups * 8;
     if (run_values > uint64_t(std::numeric_limits<int32_t>::max())) {
         throw std::runtime_error("decode: bit-packed run exceeds format length limit");
@@ -230,6 +238,9 @@ size_t decode_bit_packed_run(std::span<const uint8_t> bytes, size_t& position,
     const size_t total_avail = bytes.size() - position;
     auto* out_ptr = output.data();
     const auto* dict_ptr = dictionary.data();
+    const bool populate_mask = !match_mask.empty() && !dict_matches.empty();
+    auto* mask_ptr = populate_mask ? match_mask.data() : nullptr;
+    const auto* match_lookup = populate_mask ? dict_matches.data() : nullptr;
 
     for (size_t index = 0; index < values_to_decode; ++index) {
         uint32_t dictionary_id = 0;
@@ -261,6 +272,9 @@ size_t decode_bit_packed_run(std::span<const uint8_t> bytes, size_t& position,
             out_ptr[index] = dictionary_id;
         } else {
             out_ptr[index] = dict_ptr[dictionary_id];
+        }
+        if (populate_mask) {
+            mask_ptr[index] = match_lookup[dictionary_id];
         }
     }
     position += static_cast<size_t>(packed_bytes);
@@ -301,16 +315,19 @@ int64_t validate_chunk_input(std::span<const uint8_t> bytes, const Chunk& chunk,
 // Mutable state is local to one chunk; its dictionary is reused only across that chunk's pages.
 struct ChunkDecodeState {
     std::vector<int64_t> dictionary;
+    std::vector<uint8_t> dict_matches;
     ReusableBuffer<uint32_t> indices;
     size_t written_values = 0;
     bool saw_dictionary = false;
     bool saw_data = false;
+    bool predicate_active = false;
 };
 
 // Load the first/only dictionary page into state after validating its position and size.
 void decode_dictionary_page(const PageHeader& page, std::span<const uint8_t> body,
                             size_t page_offset, size_t value_width, const Chunk& chunk,
-                            ChunkDecodeState& state, DecodeCounts& counts) {
+                            ChunkDecodeState& state, DecodeCounts& counts,
+                            const DecodeOptions& options) {
     if (state.saw_dictionary || state.saw_data || page_offset != 0) {
         throw std::runtime_error("decode: dictionary must occur once at start of chunk");
     }
@@ -333,6 +350,19 @@ void decode_dictionary_page(const PageHeader& page, std::span<const uint8_t> bod
     state.saw_dictionary = true;
     ++counts.dictionary_pages;
     counts.dictionary_entries += values;
+
+    if (options.predicate.active && !options.predicate.match_mask.empty()) {
+        state.predicate_active = true;
+        state.dict_matches.resize(values);
+        const auto lower = options.predicate.lower;
+        const auto upper = options.predicate.upper;
+        const auto* dict = state.dictionary.data();
+        auto* match = state.dict_matches.data();
+        for (size_t i = 0; i < values; ++i) {
+            match[i] = (uint64_t(dict[i]) - uint64_t(lower) <=
+                        uint64_t(upper) - uint64_t(lower)) ? 1 : 0;
+        }
+    }
 }
 
 // Decode one data page into the remaining output and update chunk progress/counters.
@@ -347,11 +377,23 @@ void decode_data_page(const PageHeader& page, std::span<const uint8_t> body,
     if (page.encoding == parquet_thrift::Encoding::PLAIN) {
         decode_plain(body, value_width, destination);
         counts.plain_values += values;
+        if (state.predicate_active && !options.predicate.match_mask.empty()) {
+            const auto lower = options.predicate.lower;
+            const auto upper = options.predicate.upper;
+            auto page_mask = options.predicate.match_mask.subspan(state.written_values, values);
+            for (size_t i = 0; i < values; ++i) {
+                page_mask[i] = (uint64_t(destination[i]) - uint64_t(lower) <=
+                                uint64_t(upper) - uint64_t(lower)) ? 1 : 0;
+            }
+        }
     } else if (page.encoding == parquet_thrift::Encoding::PLAIN_DICTIONARY ||
                page.encoding == parquet_thrift::Encoding::RLE_DICTIONARY) {
         if (!state.saw_dictionary) {
             throw std::runtime_error("decode: dictionary data page precedes dictionary");
         }
+        auto page_mask = state.predicate_active
+            ? options.predicate.match_mask.subspan(state.written_values, values)
+            : std::span<uint8_t>{};
         // Use separate ID buffer when explicitly requested, or dynamically when dictionary is large
         // (> 256 entries) to prevent CPU cache stalls and enable vectorized gather.
         const bool use_separate = options.separate_dictionary_ids ||
@@ -361,13 +403,15 @@ void decode_data_page(const PageHeader& page, std::span<const uint8_t> body,
             auto indices = state.indices.prepare(values);
             if (options.timing) { add_elapsed(true, started, options.timing->index_allocation_ms); }
             started = start_timer(options.timing != nullptr);
-            decode_dictionary_indices(body, state.dictionary.size(), indices, &counts, options);
+            decode_dictionary_indices(body, state.dictionary.size(), indices, &counts, options,
+                                      state.dict_matches, page_mask);
             if (options.timing) { add_elapsed(true, started, options.timing->index_decode_ms); }
             started = start_timer(options.timing != nullptr);
             gather_dictionary(indices, state.dictionary, destination);
             if (options.timing) { add_elapsed(true, started, options.timing->gather_ms); }
         } else {
-            decode_dictionary(body, state.dictionary, destination, &counts, options);
+            decode_dictionary(body, state.dictionary, destination, &counts, options,
+                              state.dict_matches, page_mask);
         }
         counts.dictionary_values += values;
     } else {
@@ -426,7 +470,9 @@ void decode_plain(std::span<const uint8_t> bytes, size_t width, std::span<int64_
 template<bool Indices>
 void decode_hybrid(std::span<const uint8_t> bytes, std::span<const int64_t> dictionary,
                    size_t dictionary_size, std::span<std::conditional_t<Indices, uint32_t, int64_t>> output,
-                   DecodeCounts* counts, DecodeOptions options) {
+                   DecodeCounts* counts, DecodeOptions options,
+                   std::span<const uint8_t> dict_matches = {},
+                   std::span<uint8_t> match_mask = {}) {
     if (bytes.empty()) {
         throw std::runtime_error("decode: missing dictionary ID bit width");
     }
@@ -444,8 +490,9 @@ void decode_hybrid(std::span<const uint8_t> bytes, std::span<const int64_t> dict
             throw std::runtime_error("decode: zero-length hybrid run");
         }
         auto remaining_output = output.subspan(written_values);
+        auto remaining_mask = match_mask.empty() ? std::span<uint8_t>{} : match_mask.subspan(written_values);
         if ((run_header & 1) == 0) {
-            const auto written = decode_rle_run<Indices>(bytes, position, bit_width, units, dictionary, dictionary_size, remaining_output);
+            const auto written = decode_rle_run<Indices>(bytes, position, bit_width, units, dictionary, dictionary_size, remaining_output, dict_matches, remaining_mask);
             written_values += written;
             if (counts) {
                 ++counts->rle_runs;
@@ -454,9 +501,9 @@ void decode_hybrid(std::span<const uint8_t> bytes, std::span<const int64_t> dict
         } else {
             size_t written;
             if (options.naive_bit_unpacking) {
-                written = decode_bit_packed_run<Indices, true>(bytes, position, bit_width, units, dictionary, dictionary_size, remaining_output);
+                written = decode_bit_packed_run<Indices, true>(bytes, position, bit_width, units, dictionary, dictionary_size, remaining_output, dict_matches, remaining_mask);
             } else {
-                written = decode_bit_packed_run<Indices, false>(bytes, position, bit_width, units, dictionary, dictionary_size, remaining_output);
+                written = decode_bit_packed_run<Indices, false>(bytes, position, bit_width, units, dictionary, dictionary_size, remaining_output, dict_matches, remaining_mask);
             }
             written_values += written;
             if (counts) {
@@ -472,14 +519,16 @@ void decode_hybrid(std::span<const uint8_t> bytes, std::span<const int64_t> dict
 
 // Expand hybrid IDs directly into values without allocating an intermediate ID buffer.
 void decode_dictionary(std::span<const uint8_t> bytes, std::span<const int64_t> dictionary,
-                       std::span<int64_t> output, DecodeCounts* counts, DecodeOptions options) {
-    decode_hybrid<false>(bytes, dictionary, dictionary.size(), output, counts, options);
+                       std::span<int64_t> output, DecodeCounts* counts, DecodeOptions options,
+                       std::span<const uint8_t> dict_matches, std::span<uint8_t> match_mask) {
+    decode_hybrid<false>(bytes, dictionary, dictionary.size(), output, counts, options, dict_matches, match_mask);
 }
 
 // Return validated IDs for experiments that measure unpacking and gathering separately.
 void decode_dictionary_indices(std::span<const uint8_t> bytes, size_t dictionary_size,
-                               std::span<uint32_t> output, DecodeCounts* counts, DecodeOptions options) {
-    decode_hybrid<true>(bytes, {}, dictionary_size, output, counts, options);
+                               std::span<uint32_t> output, DecodeCounts* counts, DecodeOptions options,
+                               std::span<const uint8_t> dict_matches, std::span<uint8_t> match_mask) {
+    decode_hybrid<true>(bytes, {}, dictionary_size, output, counts, options, dict_matches, match_mask);
 }
 
 // Materialize IDs into values, preserving range checks for this standalone entry point.
@@ -528,7 +577,7 @@ void decode_chunk(std::span<const uint8_t> bytes, const Chunk& chunk,
             if (options.timing) { add_elapsed(true, stage_start, options.timing->checksum_ms); }
         }
         if (page.dictionary) {
-            decode_dictionary_page(page, body, page_offset, value_width, chunk, state, counts);
+            decode_dictionary_page(page, body, page_offset, value_width, chunk, state, counts, options);
         } else {
             // The first data page must agree with the footer's absolute offset.
             if (!state.saw_data && uint64_t(chunk_start) + page_offset != uint64_t(*chunk.data_offset)) {
