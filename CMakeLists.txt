@@ -37,6 +37,7 @@ add_library(parquet_metadata_core
     src/file_reader.cpp src/metadata_reader.cpp
     src/query_parser.cpp src/planner.cpp src/plan_json.cpp
     src/decoder.cpp src/scanner.cpp src/scan_json.cpp src/value_digest.cpp
+    src/cost_model.cpp
 )
 target_include_directories(parquet_metadata_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(parquet_metadata_core PRIVATE parquet_thrift
