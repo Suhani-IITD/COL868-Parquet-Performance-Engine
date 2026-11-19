@@ -230,7 +230,7 @@ void add_required_column(const Metadata& metadata, const std::string& name,
 
 // Bind projection and predicate columns, deduplicate them and validate endpoint semantics.
 QueryColumns prepare_query_columns(const Metadata& metadata, const Query& query, Plan& plan) {
-    if (query.projection.empty()) {
+    if (query.projection.empty() && !query.count_only) {
         throw std::invalid_argument("at least one projection column is required");
     }
     QueryColumns columns;
@@ -295,10 +295,22 @@ GroupPlan plan_row_group(const Metadata& metadata, size_t index, const Query& qu
                                find_group_chunk(source, *columns.predicate), *query.predicate);
     }
     if (group.retained) {
-        for (const auto& column : columns.required) {
-            auto range = plan_chunk_range(find_group_chunk(source, column), column, source, metadata);
-            add_to_total(group.chunk_bytes, range.bytes);
-            group.chunks.push_back(std::move(range));
+        if (group.min && group.max && query.predicate) {
+            const auto& pred = *query.predicate;
+            bool low_ok = !pred.lower || (pred.lower->inclusive ? (*group.min >= pred.lower->value) : (*group.min > pred.lower->value));
+            bool up_ok = !pred.upper || (pred.upper->inclusive ? (*group.max <= pred.upper->value) : (*group.max < pred.upper->value));
+            if (low_ok && up_ok) {
+                group.fully_contained = true;
+                group.reason = "fully_contained_within_predicate";
+            }
+        }
+        const bool skip_chunks = query.count_only && (group.fully_contained || !query.predicate);
+        if (!skip_chunks) {
+            for (const auto& column : columns.required) {
+                auto range = plan_chunk_range(find_group_chunk(source, column), column, source, metadata);
+                add_to_total(group.chunk_bytes, range.bytes);
+                group.chunks.push_back(std::move(range));
+            }
         }
     }
     return group;

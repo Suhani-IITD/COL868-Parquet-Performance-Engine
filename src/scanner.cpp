@@ -283,8 +283,19 @@ ScanResult scan(FileReader& file, const Metadata& metadata, const Query& query, 
     const auto initial_calls = file.read_calls();
     size_t result_cells = 0;
 
+    if (query.count_only && !query.predicate) {
+        result.matched_rows = static_cast<uint64_t>(metadata.rows);
+        finish_scan_io(file, initial_bytes, initial_calls, result);
+        add_elapsed(options.timing, execution_start, result.timing.execution_ms);
+        return result;
+    }
+
     for (const auto& group : result.plan.groups) {
         if (!group.retained) {
+            continue;
+        }
+        if (query.count_only && group.fully_contained) {
+            result.matched_rows += static_cast<uint64_t>(group.rows);
             continue;
         }
         context->mask_valid = false;

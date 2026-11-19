@@ -16,6 +16,7 @@ struct QueryArguments {
     bool rows = false;
     bool verify = false, timing = false, diagnostics = false;
     bool naive_decoder = false, separate_ids = false;
+    bool count_only = false;
 };
 
 enum class QueryCommand { Plan, Scan, Predict };

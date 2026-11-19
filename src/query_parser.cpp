@@ -63,6 +63,8 @@ void parse_query_flag(int argc, char* argv[], int& index, const std::string& fla
         arguments.naive_decoder = true;
     } else if (flag == "--separate-ids" && command == QueryCommand::Scan) {
         arguments.separate_ids = true;
+    } else if (flag == "--count") {
+        arguments.count_only = true;
     } else if (flag == "--select") {
         arguments.projection = parse_projection_columns(read_flag_value(argc, argv, index, flag));
     } else if (flag == "--where") {
@@ -98,8 +100,8 @@ void validate_query_arguments(const QueryArguments& arguments, QueryCommand comm
     if (command == QueryCommand::Predict && !arguments.model) {
         throw std::invalid_argument("--model is required");
     }
-    if (arguments.projection.empty()) {
-        throw std::invalid_argument("--select is required");
+    if (arguments.projection.empty() && !arguments.count_only) {
+        throw std::invalid_argument("--select is required (or use --count)");
     }
     if (arguments.equal && (arguments.lower || arguments.upper)) {
         throw std::invalid_argument("--eq cannot be combined with range endpoints");
@@ -189,6 +191,7 @@ Query convert_query_values(const QueryArguments& arguments, const Metadata& meta
     Query query;
     query.projection = arguments.projection;
     query.pruning = arguments.pruning;
+    query.count_only = arguments.count_only;
     if (!arguments.predicate_column) {
         return query;
     }

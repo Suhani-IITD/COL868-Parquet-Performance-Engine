@@ -17,6 +17,7 @@ struct Query {
     std::vector<std::string> projection;
     std::optional<Predicate> predicate;
     bool pruning = true;
+    bool count_only = false;
 };
 
 // Borrows a schema node: metadata must outlive this lookup result.
@@ -39,6 +40,7 @@ struct GroupPlan {
     std::optional<int64_t> min, max;
     std::vector<PlannedChunk> chunks;
     uint64_t chunk_bytes = 0;
+    bool fully_contained = false;
 };
 struct Plan {
     Query query;
