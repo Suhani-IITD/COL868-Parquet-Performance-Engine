@@ -1,4 +1,5 @@
 #include "parquetscope/decoder.hpp"
+#include "parquetscope/reusable_buffer.hpp"
 #include "parquet_types.h"
 
 #include <thrift/protocol/TCompactProtocol.h>
@@ -224,6 +225,12 @@ size_t decode_bit_packed_run(std::span<const uint8_t> bytes, size_t& position,
         throw std::runtime_error("decode: truncated bit-packed run");
     }
     const auto values_to_decode = static_cast<size_t>(std::min<uint64_t>(run_values, output.size()));
+    const uint64_t mask = (bit_width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << bit_width) - 1);
+    const uint8_t* in_ptr = bytes.data() + position;
+    const size_t total_avail = bytes.size() - position;
+    auto* out_ptr = output.data();
+    const auto* dict_ptr = dictionary.data();
+
     for (size_t index = 0; index < values_to_decode; ++index) {
         uint32_t dictionary_id = 0;
         if constexpr (Naive) {
@@ -234,18 +241,26 @@ size_t decode_bit_packed_run(std::span<const uint8_t> bytes, size_t& position,
         } else if (bit_width != 0) {
             const size_t bit_position = index * bit_width;
             const size_t byte_position = bit_position / 8;
-            const auto word = load_little_endian(bytes.subspan(position + byte_position,
-                static_cast<size_t>(packed_bytes) - byte_position));
-            const uint64_t mask = (uint64_t{1} << bit_width) - 1;
+            uint64_t word = 0;
+            if (byte_position + sizeof(uint64_t) <= total_avail) {
+                if constexpr (std::endian::native == std::endian::little) {
+                    std::memcpy(&word, in_ptr + byte_position, sizeof(word));
+                } else {
+                    word = load_little_endian(bytes.subspan(position + byte_position, 8));
+                }
+            } else {
+                word = load_little_endian(bytes.subspan(position + byte_position,
+                    static_cast<size_t>(packed_bytes) - byte_position));
+            }
             dictionary_id = static_cast<uint32_t>((word >> (bit_position % 8)) & mask);
         }
-        if (dictionary_id >= dictionary_size) {
+        if (dictionary_id >= dictionary_size) [[unlikely]] {
             throw std::runtime_error("decode: dictionary ID out of range");
         }
         if constexpr (Indices) {
-            output[index] = dictionary_id;
+            out_ptr[index] = dictionary_id;
         } else {
-            output[index] = dictionary[dictionary_id];
+            out_ptr[index] = dict_ptr[dictionary_id];
         }
     }
     position += static_cast<size_t>(packed_bytes);
@@ -286,7 +301,7 @@ int64_t validate_chunk_input(std::span<const uint8_t> bytes, const Chunk& chunk,
 // Mutable state is local to one chunk; its dictionary is reused only across that chunk's pages.
 struct ChunkDecodeState {
     std::vector<int64_t> dictionary;
-    std::vector<uint32_t> indices;
+    ReusableBuffer<uint32_t> indices;
     size_t written_values = 0;
     bool saw_dictionary = false;
     bool saw_data = false;
@@ -337,16 +352,19 @@ void decode_data_page(const PageHeader& page, std::span<const uint8_t> body,
         if (!state.saw_dictionary) {
             throw std::runtime_error("decode: dictionary data page precedes dictionary");
         }
-        if (options.separate_dictionary_ids) {
-            // The extra ID buffer is intentional only for this experimental mode.
+        // Use separate ID buffer when explicitly requested, or dynamically when dictionary is large
+        // (> 256 entries) to prevent CPU cache stalls and enable vectorized gather.
+        const bool use_separate = options.separate_dictionary_ids ||
+            (!options.naive_bit_unpacking && state.dictionary.size() > 256);
+        if (use_separate) {
             auto started = start_timer(options.timing != nullptr);
-            state.indices.resize(values);
+            auto indices = state.indices.prepare(values);
             if (options.timing) { add_elapsed(true, started, options.timing->index_allocation_ms); }
             started = start_timer(options.timing != nullptr);
-            decode_dictionary_indices(body, state.dictionary.size(), state.indices, &counts, options);
+            decode_dictionary_indices(body, state.dictionary.size(), indices, &counts, options);
             if (options.timing) { add_elapsed(true, started, options.timing->index_decode_ms); }
             started = start_timer(options.timing != nullptr);
-            gather_dictionary(state.indices, state.dictionary, destination);
+            gather_dictionary(indices, state.dictionary, destination);
             if (options.timing) { add_elapsed(true, started, options.timing->gather_ms); }
         } else {
             decode_dictionary(body, state.dictionary, destination, &counts, options);
@@ -468,9 +486,16 @@ void decode_dictionary_indices(std::span<const uint8_t> bytes, size_t dictionary
 void gather_dictionary(std::span<const uint32_t> ids, std::span<const int64_t> dictionary,
                        std::span<int64_t> output) {
     if (ids.size() != output.size()) { throw std::runtime_error("decode: gather size mismatch"); }
-    for (size_t index = 0; index < ids.size(); ++index) {
-        if (ids[index] >= dictionary.size()) { throw std::runtime_error("decode: dictionary ID out of range"); }
-        output[index] = dictionary[ids[index]];
+    const size_t dict_size = dictionary.size();
+    const auto* dict = dictionary.data();
+    const auto* in_ids = ids.data();
+    auto* out = output.data();
+    const size_t n = ids.size();
+    for (size_t index = 0; index < n; ++index) {
+        if (in_ids[index] >= dict_size) [[unlikely]] {
+            throw std::runtime_error("decode: dictionary ID out of range");
+        }
+        out[index] = dict[in_ids[index]];
     }
 }
 
