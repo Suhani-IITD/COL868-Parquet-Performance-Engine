@@ -1,1 +1,5 @@
 /build/
+/experiments/data/
+/experiments/results/
+/experiments/.venv/
+__pycache__/
