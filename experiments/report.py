@@ -102,6 +102,20 @@ def main():
                          f"{errors[int(0.9 * (len(errors) - 1))]:.1%}", f"{statistics.median(decode):.1%}"])
         print(table(["runs", "n", "median", "p90", "decode median"], body))
 
+        feature_subset = [r for r in predicted if r.get("est_packed") != "" and r.get("act_packed") is not None]
+        if feature_subset:
+            print("## Feature accuracy: metadata estimates vs decoded values (median error)\n")
+            f_body = []
+            for order in orders:
+                order_runs = [r for r in feature_subset if r["order"] == order and r["encoding"] == "dict"]
+                if not order_runs:
+                    continue
+                p_err = [abs(r["est_packed"] - r["act_packed"]) / max(1.0, r["act_packed"]) for r in order_runs]
+                r_err = [abs(r["est_rle"] - r["act_rle"]) / max(1.0, r["act_rle"]) for r in order_runs]
+                f_body.append([order, len(order_runs), f"{statistics.median(p_err):.1%}", f"{statistics.median(r_err):.1%}"])
+            if f_body:
+                print(table(["order", "n", "bit-packed error", "rle error"], f_body))
+
 
 if __name__ == "__main__":
     main()

@@ -5,8 +5,13 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cmath>
+#include <ctime>
+#include <fstream>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 #include <spawn.h>
 #include <stdexcept>
 #include <sys/wait.h>
@@ -121,7 +126,8 @@ std::vector<double> fit_nonnegative(const Matrix& x, const std::vector<double>& 
     for (const auto& row : x) {
         for (size_t j = 0; j < terms; ++j) { scale[j] = std::max(scale[j], std::abs(row[j])); }
     }
-    const auto weight = [&](size_t i) { return 1.0 / std::max(y[i], 0.05); };
+    constexpr double min_time_weight_floor_ms = 0.05;
+    const auto weight = [&](size_t i) { return 1.0 / std::max(y[i], min_time_weight_floor_ms); };
     double best_error = std::numeric_limits<double>::infinity();
     for (size_t mask = 1; mask < (size_t{1} << terms); ++mask) {
         std::vector<size_t> active;
@@ -158,17 +164,31 @@ std::vector<double> fit_nonnegative(const Matrix& x, const std::vector<double>& 
     return best;
 }
 
-// Return the median value from a set of timing samples.
+// Return the median value from a set of timing samples, averaging middle values for even sizes.
 double median(std::vector<double> values) {
-    const auto middle = values.begin() + static_cast<std::ptrdiff_t>(values.size() / 2);
-    std::nth_element(values.begin(), middle, values.end());
-    return *middle;
+    if (values.empty()) { return 0.0; }
+    std::sort(values.begin(), values.end());
+    const size_t n = values.size();
+    if (n % 2 == 1) {
+        return values[n / 2];
+    }
+    return (values[n / 2 - 1] + values[n / 2]) / 2.0;
 }
 
 // Run this executable as a child process and parse its JSON output.
 nlohmann::json run_self(std::vector<std::string> args) {
     int fds[2];
     if (pipe(fds) != 0) { throw std::runtime_error("calibrate: pipe failed"); }
+    // RAII guard ensures pipe descriptors are closed cleanly on exception paths.
+    struct PipeGuard {
+        int read_fd = -1;
+        int write_fd = -1;
+        ~PipeGuard() {
+            if (read_fd >= 0) close(read_fd);
+            if (write_fd >= 0) close(write_fd);
+        }
+    } guard{fds[0], fds[1]};
+
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
@@ -181,12 +201,16 @@ nlohmann::json run_self(std::vector<std::string> args) {
     const int spawned = posix_spawn(&pid, argv[0], &actions, nullptr, argv.data(), environ);
     posix_spawn_file_actions_destroy(&actions);
     close(fds[1]);
+    guard.write_fd = -1;
+
     std::string output;
     char buffer[4096];
     for (ssize_t n; spawned == 0 && (n = read(fds[0], buffer, sizeof buffer)) > 0;) {
         output.append(buffer, static_cast<size_t>(n));
     }
     close(fds[0]);
+    guard.read_fd = -1;
+
     int status = 0;
     if (spawned != 0 || waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         throw std::runtime_error("calibrate: scan subprocess failed");
@@ -267,6 +291,30 @@ CostPrediction predict_cost(const CostModel& model, const CostFeatures& features
     return prediction;
 }
 
+// Read CPU model name from /proc/cpuinfo on Linux.
+std::string get_cpu_model() {
+    std::ifstream file("/proc/cpuinfo");
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.starts_with("model name")) {
+            const auto colon = line.find(':');
+            if (colon != std::string::npos && colon + 2 < line.size()) {
+                return line.substr(colon + 2);
+            }
+        }
+    }
+    return "unknown";
+}
+
+// Return current ISO 8601 UTC timestamp.
+std::string get_current_timestamp() {
+    const auto now = std::chrono::system_clock::now();
+    const auto in_time_t = std::chrono::system_clock::to_time_t(now);
+    std::stringstream ss;
+    ss << std::put_time(std::gmtime(&in_time_t), "%Y-%m-%dT%H:%M:%SZ");
+    return ss.str();
+}
+
 // Scan every supported column whole, with and without an always-true predicate, plus all columns
 // together; then fit each stage separately.
 CostModel calibrate(std::span<const std::string> paths, int repeats) {
@@ -322,6 +370,8 @@ CostModel calibrate(std::span<const std::string> paths, int repeats) {
     const auto read = fit_nonnegative(read_x, read_y);
     const auto decode = fit_nonnegative(decode_x, decode_y);
     const auto filter = fit_nonnegative(filter_x, filter_y);
+    const auto fixed = fit_nonnegative(fixed_x, fixed_y);
+
     CostModel model;
     model.planning_start_ms = planning[0];
     model.footer_byte_ms = planning[1];
@@ -340,21 +390,48 @@ CostModel calibrate(std::span<const std::string> paths, int repeats) {
     model.dictionary_entry_ms = decode[7];
     model.dictionary_chunk_ms = decode[8];
     model.filter_row_ms = filter.empty() ? 0.0 : filter[0];
-    model.fixed_ms = fit_nonnegative(fixed_x, fixed_y)[0];
+    model.fixed_ms = fixed.empty() ? 0.0 : fixed[0];
+
+    model.environment.version = "v2";
+    model.environment.build_type = "Release";
+    model.environment.cpu_model = get_cpu_model();
+    model.environment.calibration_files.assign(paths.begin(), paths.end());
+    model.environment.timestamp = get_current_timestamp();
     return model;
 }
 
-// Serialize cost model coefficients to JSON.
+// Serialize cost model coefficients and environment provenance to JSON.
 nlohmann::json model_to_json(const CostModel& model) {
     nlohmann::json json;
     for (const auto& [name, field] : model_fields) { json[name] = model.*field; }
+    json["environment"] = {
+        {"version", model.environment.version},
+        {"build_type", model.environment.build_type},
+        {"cpu_model", model.environment.cpu_model},
+        {"calibration_files", model.environment.calibration_files},
+        {"timestamp", model.environment.timestamp}
+    };
     return json;
 }
 
 // Deserialize cost model coefficients from JSON.
 CostModel model_from_json(const nlohmann::json& json) {
     CostModel model;
-    for (const auto& [name, field] : model_fields) { model.*field = json.at(name).get<double>(); }
+    for (const auto& [name, field] : model_fields) {
+        if (json.contains(name)) {
+            model.*field = json.at(name).get<double>();
+        }
+    }
+    if (json.contains("environment") && json["environment"].is_object()) {
+        const auto& env = json["environment"];
+        if (env.contains("version")) model.environment.version = env["version"].get<std::string>();
+        if (env.contains("build_type")) model.environment.build_type = env["build_type"].get<std::string>();
+        if (env.contains("cpu_model")) model.environment.cpu_model = env["cpu_model"].get<std::string>();
+        if (env.contains("calibration_files")) {
+            model.environment.calibration_files = env["calibration_files"].get<std::vector<std::string>>();
+        }
+        if (env.contains("timestamp")) model.environment.timestamp = env["timestamp"].get<std::string>();
+    }
     return model;
 }
 

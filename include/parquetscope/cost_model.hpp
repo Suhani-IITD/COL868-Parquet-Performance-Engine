@@ -4,6 +4,7 @@
 #include <nlohmann/json.hpp>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace parquetscope {
 
@@ -21,6 +22,15 @@ struct CostFeatures {
     double footer_bytes = 0, groups_columns = 0;
 };
 
+// Metadata describing the host and environment where the model was calibrated.
+struct ModelEnvironment {
+    std::string version = "v2";
+    std::string build_type = "Release";
+    std::string cpu_model;
+    std::vector<std::string> calibration_files;
+    std::string timestamp;
+};
+
 // Milliseconds per unit of each feature.
 struct CostModel {
     double fixed_ms = 0;
@@ -34,6 +44,8 @@ struct CostModel {
     double dictionary_entry_ms = 0, dictionary_chunk_ms = 0;
     // Predicate filter evaluation term.
     double filter_row_ms = 0;
+    // Calibration environment provenance.
+    ModelEnvironment environment;
 };
 
 struct CostPrediction {

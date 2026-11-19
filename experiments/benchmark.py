@@ -31,6 +31,7 @@ FIELDS = [
     "file", "order", "encoding", "row_group", "query", "family", "mode", "selectivity", "pruned_groups",
     "planned_bytes", "actual_bytes", "file_bytes", "execution_ms", "read_ms", "decode_ms", "filter_ms",
     "wall_ms", "duckdb_ms", "predicted_ms", "predicted_decode_ms",
+    "act_packed", "act_rle", "est_packed", "est_rle",
 ]
 
 
@@ -115,12 +116,16 @@ def rows(args):
                     "selectivity": expected / total_rows, "pruned_groups": result["pruned_groups"],
                     "planned_bytes": result["io"]["planned_chunk_bytes"],
                     "actual_bytes": result["io"]["actual_chunk_bytes"], "file_bytes": path.stat().st_size,
+                    "act_packed": result["decoded"]["bit_packed_values"],
+                    "act_rle": result["decoded"]["rle_values"],
                     **measure(args.bin, path, query, args.repeats), "duckdb_ms": duckdb_ms,
                 }
                 if args.model and mode in ("default", "no_prune", "all_columns"):
                     predicted, _ = engine(args.bin, "predict", path, [*query, "--model", str(args.model)])
                     row["predicted_ms"] = predicted["predicted_ms"]["total"]
                     row["predicted_decode_ms"] = predicted["predicted_ms"]["decode"]
+                    row["est_packed"] = predicted["features"]["packed_values"]
+                    row["est_rle"] = predicted["features"]["rle_values"]
                 yield row
         print(f"done {path.name}", flush=True)
 

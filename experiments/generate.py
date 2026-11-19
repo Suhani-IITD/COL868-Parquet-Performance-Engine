@@ -13,7 +13,7 @@ import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-ROW_GROUP_SIZES = (16_384, 131_072, 1_048_576)
+ROW_GROUP_SIZES = (4_096, 16_384, 131_072, 1_048_576)
 ENCODINGS = {"dict": True, "plain": False}
 _HASH = "hash(l_orderkey, l_linenumber)"
 ORDERS = {
