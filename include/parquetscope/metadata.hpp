@@ -59,6 +59,8 @@ struct RowGroup {
 
 // Owned application metadata. No Thrift objects or references to footer buffers.
 struct Metadata {
+    // Runtime reader identity; not serialized Parquet metadata.
+    uint64_t reader_identity = 0;
     bool encrypted = false;
     uint64_t file_size = 0, footer_offset = 0, footer_length = 0;
     int32_t version = 0;

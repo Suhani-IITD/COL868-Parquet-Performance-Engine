@@ -15,6 +15,7 @@ constexpr auto usage =
     "       parquet_metadata scan FILE.parquet --select COL[,COL...] [predicate flags] [--rows]\n"
     "Predicate flags: --where COL (--eq VALUE | [--ge VALUE | --gt VALUE] [--le VALUE | --lt VALUE])\n"
     "Optional: --no-prune. Results are JSON; scan returns a count unless --rows is given.\n"
+    "Scan flags: --verify | --timing; --diagnostics; --naive-decoder; --separate-ids.\n"
     "DATE endpoints accept epoch days or YYYY-MM-DD.\n";
 
 // Print one indented JSON result, replacing invalid descriptive UTF-8 for display.
@@ -55,6 +56,11 @@ void run_query(int argc, char* argv[], parquetscope::QueryCommand command) {
     } else {
         parquetscope::ScanOptions scan_options;
         scan_options.include_rows = arguments.rows;
+        scan_options.digest = arguments.verify;
+        scan_options.timing = arguments.timing;
+        scan_options.diagnostics = arguments.diagnostics;
+        scan_options.decoding.naive_bit_unpacking = arguments.naive_decoder;
+        scan_options.decoding.separate_dictionary_ids = arguments.separate_ids;
         print_json(parquetscope::scan_to_json(parquetscope::scan(file, metadata, query, scan_options)));
     }
 }

@@ -53,6 +53,16 @@ void parse_query_flag(int argc, char* argv[], int& index, const std::string& fla
         arguments.pruning = false;
     } else if (flag == "--rows" && command == QueryCommand::Scan) {
         arguments.rows = true;
+    } else if (flag == "--verify" && command == QueryCommand::Scan) {
+        arguments.verify = true;
+    } else if (flag == "--timing" && command == QueryCommand::Scan) {
+        arguments.timing = true;
+    } else if (flag == "--diagnostics" && command == QueryCommand::Scan) {
+        arguments.diagnostics = true;
+    } else if (flag == "--naive-decoder" && command == QueryCommand::Scan) {
+        arguments.naive_decoder = true;
+    } else if (flag == "--separate-ids" && command == QueryCommand::Scan) {
+        arguments.separate_ids = true;
     } else if (flag == "--select") {
         arguments.projection = parse_projection_columns(read_flag_value(argc, argv, index, flag));
     } else if (flag == "--where") {
@@ -82,6 +92,9 @@ void parse_query_flag(int argc, char* argv[], int& index, const std::string& fla
 
 // Check required fields and incompatible bounds; throw on invalid combinations.
 void validate_query_arguments(const QueryArguments& arguments, QueryCommand command) {
+    if (arguments.verify && arguments.timing) {
+        throw std::invalid_argument("--verify and --timing must run separately");
+    }
     if (command == QueryCommand::Predict && !arguments.model) {
         throw std::invalid_argument("--model is required");
     }

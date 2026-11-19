@@ -1,6 +1,7 @@
 #include "parquetscope/file_reader.hpp"
 
 #include <cerrno>
+#include <atomic>
 #include <cstring>
 #include <fcntl.h>
 #include <stdexcept>
@@ -11,6 +12,8 @@ namespace parquetscope {
 
 // Open a read-only regular file and save its size/timestamps for later checks.
 FileReader::FileReader(const std::string& path) {
+    static std::atomic<uint64_t> next_identity{1};
+    identity_ = next_identity.fetch_add(1, std::memory_order_relaxed);
     // Read-only access; do not carry this descriptor into an executed program.
     file_descriptor_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (file_descriptor_ < 0) {
@@ -60,6 +63,17 @@ void FileReader::verify_unchanged() const {
 
 // Return exactly length bytes at offset, updating actual read counters or throwing.
 std::vector<uint8_t> FileReader::read(uint64_t offset, uint64_t length) {
+    if (length > 64 * 1024 * 1024 || offset > file_size_ || length > file_size_ - offset) {
+        throw std::runtime_error("read range outside file or exceeds 64 MiB resource limit");
+    }
+    std::vector<uint8_t> data(static_cast<size_t>(length));
+    read_into(offset, data);
+    return data;
+}
+
+// Read directly into reusable storage; do not allocate or initialize its bytes.
+void FileReader::read_into(uint64_t offset, std::span<uint8_t> data) {
+    const uint64_t length = data.size();
     // Subtraction avoids overflowing offset + length. Check offset first.
     if (offset > file_size_ || length > file_size_ - offset) {
         throw std::runtime_error("read range outside file");
@@ -70,7 +84,6 @@ std::vector<uint8_t> FileReader::read(uint64_t offset, uint64_t length) {
         throw std::runtime_error("read exceeds 64 MiB resource limit");
     }
 
-    std::vector<uint8_t> data(static_cast<size_t>(length));
     uint64_t completed_bytes = 0;
     while (completed_bytes < length) {
         // Count every syscall attempt, including interrupted/failed attempts.
@@ -91,12 +104,13 @@ std::vector<uint8_t> FileReader::read(uint64_t offset, uint64_t length) {
         }
 
         const auto received_bytes = static_cast<uint64_t>(returned_bytes);
-        read_ranges_.push_back({offset + completed_bytes, received_bytes});
+        if (record_ranges_) {
+            read_ranges_.push_back({offset + completed_bytes, received_bytes});
+        }
         total_bytes_read_ += received_bytes;
         completed_bytes += received_bytes;
         // A short successful read continues at the first byte still missing.
     }
-    return data;
 }
 
 } // namespace parquetscope

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <span>
 
 namespace parquetscope {
 
@@ -24,6 +25,12 @@ public:
 
     // Return exactly the requested byte interval or throw.
     std::vector<uint8_t> read(uint64_t offset, uint64_t length);
+    // Fill caller-owned storage exactly; counters accumulate across repeated reads.
+    void read_into(uint64_t offset, std::span<uint8_t> destination);
+    // Return a process-local identity binding metadata to this reader's lifetime.
+    uint64_t identity() const { return identity_; }
+    // Disable range history for repeated benchmarks; byte/call counters stay enabled.
+    void record_ranges(bool enabled) { record_ranges_ = enabled; }
     // Throw if size or timestamps differ from those recorded at opening.
     void verify_unchanged() const;
 
@@ -37,6 +44,8 @@ public:
     const std::vector<ReadRange>& ranges() const { return read_ranges_; }
 
 private:
+    uint64_t identity_ = 0;
+    bool record_ranges_ = true;
     int file_descriptor_ = -1;
     uint64_t file_size_ = 0;
     uint64_t total_bytes_read_ = 0;

@@ -556,6 +556,7 @@ Metadata read_metadata(FileReader& file) {
     const auto thrift_metadata = deserialize_footer(footer_bytes);
     auto metadata = convert_metadata(thrift_metadata, file.size(), footer);
 
+    metadata.reader_identity = file.identity();
     metadata.read_bytes = file.bytes_read();
     metadata.read_calls = file.read_calls();
     metadata.reads = file.ranges();

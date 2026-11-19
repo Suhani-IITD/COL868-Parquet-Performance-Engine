@@ -1,13 +1,17 @@
 cmake_minimum_required(VERSION 3.20)
 project(parquet_performance_engine VERSION 0.1 LANGUAGES CXX)
 
+# Default single-configuration builds to optimized code; explicit Debug remains valid.
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build configuration" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(PkgConfig REQUIRED)
 find_package(nlohmann_json REQUIRED)
-find_package(OpenSSL REQUIRED)
 pkg_check_modules(THRIFT REQUIRED IMPORTED_TARGET thrift)
 find_program(THRIFT_COMPILER thrift REQUIRED)
 
@@ -35,7 +39,7 @@ add_library(parquet_metadata_core
     src/decoder.cpp src/scanner.cpp src/scan_json.cpp src/value_digest.cpp
 )
 target_include_directories(parquet_metadata_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(parquet_metadata_core PRIVATE parquet_thrift OpenSSL::Crypto
+target_link_libraries(parquet_metadata_core PRIVATE parquet_thrift
     PUBLIC nlohmann_json::nlohmann_json)
 target_compile_options(parquet_metadata_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 

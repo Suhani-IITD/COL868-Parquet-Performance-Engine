@@ -3,15 +3,19 @@
 
 #include <algorithm>
 #include <memory>
+#include <limits>
 #include <stdexcept>
 
 namespace parquetscope {
 namespace {
-using DecodedColumns = std::vector<std::vector<int64_t>>;
+using DecodedColumns = std::vector<std::span<int64_t>>;
 
 struct ColumnSelection {
     std::vector<size_t> projection_indices;
     size_t predicate_index = 0;
+    int64_t lower = std::numeric_limits<int64_t>::min();
+    int64_t upper = std::numeric_limits<int64_t>::max();
+    bool empty = false;
 };
 
 // Check reader identity/counters and output limits before any selected chunk is read.
@@ -20,9 +24,11 @@ void validate_scan_input(FileReader& file, const Metadata& metadata, const ScanO
     if (options.include_rows && options.max_output_rows > max_result_rows) {
         throw std::runtime_error("scan: requested output row cap exceeds 100000");
     }
-    if (file.size() != metadata.file_size || file.bytes_read() != metadata.read_bytes ||
-        file.read_calls() != metadata.read_calls) {
-        throw std::runtime_error("scan: use fresh metadata from the same file reader");
+    if (file.size() != metadata.file_size || file.identity() != metadata.reader_identity) {
+        throw std::runtime_error("scan: metadata belongs to a different file reader");
+    }
+    if (options.timing && options.digest) {
+        throw std::invalid_argument("scan: verification and timing must run separately");
     }
 }
 
@@ -53,14 +59,48 @@ ColumnSelection prepare_column_selection(const Metadata& metadata, ScanResult& r
         result.columns.push_back({name, node->physical_type, unit});
     }
     if (result.plan.query.predicate) {
-        selection.predicate_index = find_required_column_index(result.plan, result.plan.query.predicate->column);
+        const auto& predicate = *result.plan.query.predicate;
+        selection.predicate_index = find_required_column_index(result.plan, predicate.column);
+        // Normalize exclusive bounds without signed overflow at the extrema.
+        if (predicate.lower) {
+            selection.lower = predicate.lower->value;
+            if (!predicate.lower->inclusive) {
+                if (selection.lower == std::numeric_limits<int64_t>::max()) { selection.empty = true; }
+                else { ++selection.lower; }
+            }
+        }
+        if (predicate.upper) {
+            selection.upper = predicate.upper->value;
+            if (!predicate.upper->inclusive) {
+                if (selection.upper == std::numeric_limits<int64_t>::min()) { selection.empty = true; }
+                else { --selection.upper; }
+            }
+        }
+        selection.empty = selection.empty || selection.lower > selection.upper;
     }
     return selection;
 }
 
+// Add one chunk's observed counters to scan totals; no per-value history is retained.
+void add_decode_counts(DecodeCounts& total, const DecodeCounts& chunk) {
+    total.data_pages += chunk.data_pages;
+    total.dictionary_pages += chunk.dictionary_pages;
+    total.plain_values += chunk.plain_values;
+    total.dictionary_values += chunk.dictionary_values;
+    total.rle_runs += chunk.rle_runs;
+    total.bit_packed_runs += chunk.bit_packed_runs;
+    total.rle_values += chunk.rle_values;
+    total.bit_packed_values += chunk.bit_packed_values;
+    total.dictionary_entries += chunk.dictionary_entries;
+    total.checksums_verified += chunk.checksums_verified;
+    for (size_t width = 0; width < total.bit_width_pages.size(); ++width) {
+        total.bit_width_pages[width] += chunk.bit_width_pages[width];
+    }
+}
+
 // Read/decode all required columns of one retained group and return their value buffers.
 DecodedColumns read_group_columns(FileReader& file, const Metadata& metadata,
-                                   const GroupPlan& group, bool timing, ScanResult& result) {
+                                   const GroupPlan& group, const ScanOptions& options, ScanContext& context, ScanResult& result) {
     if (group.chunks.empty()) {
         throw std::runtime_error("scan: retained group has no required chunks");
     }
@@ -68,25 +108,46 @@ DecodedColumns read_group_columns(FileReader& file, const Metadata& metadata,
     if (row_count > max_decoded_group_bytes / sizeof(int64_t) / group.chunks.size()) {
         throw std::runtime_error("scan: decoded row group exceeds 256 MiB resource limit");
     }
+    const bool timing = options.timing;
+    auto allocation_start = start_timer(timing);
+    context.columns.resize(group.chunks.size());
+    // Retained capacities are bounded even when queries/group sizes change.
+    uint64_t retained_values = 0;
+    for (const auto& buffer : context.columns) {
+        retained_values += std::max<uint64_t>(row_count, buffer.capacity());
+    }
+    if (retained_values > max_decoded_group_bytes / sizeof(int64_t)) {
+        context.columns.clear();
+        context.columns.resize(group.chunks.size());
+    }
     DecodedColumns columns;
     columns.reserve(group.chunks.size());
-    for (const auto& range : group.chunks) {
+    add_elapsed(timing, allocation_start, result.timing.allocation_ms);
+    for (size_t column = 0; column < group.chunks.size(); ++column) {
+        const auto& range = group.chunks[column];
         if (range.bytes > max_chunk_bytes) {
             throw std::runtime_error("scan: raw chunk exceeds 64 MiB resource limit");
         }
-        // Raw bytes live only through this column's decode.
+        // Allocate uninitialized storage only on growth, outside the read timer.
         auto started = start_timer(timing);
-        const auto bytes = file.read(range.offset, range.bytes);
-        add_elapsed(timing, started, result.timing.read_ms);
+        auto bytes = context.raw.prepare(static_cast<size_t>(range.bytes));
+        columns.push_back(context.columns[column].prepare(static_cast<size_t>(row_count)));
+        add_elapsed(timing, started, result.timing.allocation_ms);
 
         started = start_timer(timing);
-        columns.emplace_back(static_cast<size_t>(row_count));
-        add_elapsed(timing, started, result.timing.allocation_ms);
+        file.read_into(range.offset, bytes);
+        add_elapsed(timing, started, result.timing.read_ms);
 
         started = start_timer(timing);
         try {
             const auto& chunk = metadata.row_groups[group.row_group].columns[range.column_index];
-            decode_chunk(bytes, chunk, columns.back(), result.decoded);
+            DecodeCounts decoded;
+            auto decoding = options.decoding;
+            decoding.timing = nullptr;
+            if (options.timing && options.diagnostics) { decoding.timing = &result.timing; }
+            decode_chunk(bytes, chunk, columns.back(), decoded, decoding);
+            add_decode_counts(result.decoded, decoded);
+            if (options.diagnostics) { result.chunks.push_back({group.row_group, range.column, decoded}); }
         } catch (const std::exception& error) {
             throw std::runtime_error("row group " + std::to_string(group.row_group) +
                                      ", column " + range.column + ": " + error.what());
@@ -96,25 +157,10 @@ DecodedColumns read_group_columns(FileReader& file, const Metadata& metadata,
     return columns;
 }
 
-// Return whether a decoded value satisfies both optional query endpoints.
-bool matches_predicate(int64_t value, const Predicate& predicate) {
-    if (predicate.lower) {
-        if (value < predicate.lower->value) {
-            return false;
-        }
-        if (value == predicate.lower->value && !predicate.lower->inclusive) {
-            return false;
-        }
-    }
-    if (predicate.upper) {
-        if (value > predicate.upper->value) {
-            return false;
-        }
-        if (value == predicate.upper->value && !predicate.upper->inclusive) {
-            return false;
-        }
-    }
-    return true;
+// Test normalized signed bounds using unsigned subtraction (defined at INT64 extrema).
+bool matches_interval(int64_t value, const ColumnSelection& selection) {
+    return uint64_t(value) - uint64_t(selection.lower) <=
+           uint64_t(selection.upper) - uint64_t(selection.lower);
 }
 
 // Append one matched row in projection order, enforcing the total output limits.
@@ -142,8 +188,26 @@ void filter_group_rows(const DecodedColumns& columns, const ColumnSelection& sel
                        std::vector<int64_t>& digest_row, size_t& result_cells, ScanResult& result) {
     const auto& predicate = result.plan.query.predicate;
     const auto started = start_timer(options.timing);
+    if (selection.empty) {
+        add_elapsed(options.timing, started, result.timing.filter_ms);
+        return;
+    }
+    // Count-only scans avoid optional-bound, digest and output-mode branches per row.
+    if (!digest && !options.include_rows) {
+        if (!predicate) {
+            result.matched_rows += columns.front().size();
+        } else {
+            uint64_t matches = 0;
+            for (const auto value : columns[selection.predicate_index]) {
+                matches += matches_interval(value, selection);
+            }
+            result.matched_rows += matches;
+        }
+        add_elapsed(options.timing, started, result.timing.filter_ms);
+        return;
+    }
     for (size_t row = 0; row < columns.front().size(); ++row) {
-        if (predicate && !matches_predicate(columns[selection.predicate_index][row], *predicate)) {
+        if (predicate && !matches_interval(columns[selection.predicate_index][row], selection)) {
             continue;
         }
         ++result.matched_rows;
@@ -176,6 +240,10 @@ void finish_scan_io(FileReader& file, uint64_t initial_bytes, uint64_t initial_c
 ScanResult scan(FileReader& file, const Metadata& metadata, const Query& query, ScanOptions options) {
     validate_scan_input(file, metadata, options);
     ScanResult result;
+    result.timed = options.timing;
+    ScanContext local_context;
+    auto* context = options.context;
+    if (!context) { context = &local_context; }
     std::unique_ptr<ValueDigest> digest;
     if (options.digest) {
         digest = std::make_unique<ValueDigest>();
@@ -197,14 +265,16 @@ ScanResult scan(FileReader& file, const Metadata& metadata, const Query& query, 
         if (!group.retained) {
             continue;
         }
-        const auto columns = read_group_columns(file, metadata, group, options.timing, result);
+        const auto columns = read_group_columns(file, metadata, group, options, *context, result);
         filter_group_rows(columns, selection, options, digest.get(), digest_row, result_cells, result);
-        // Decoded columns are released here before processing the next group.
+        // The views expire here; context storage is overwritten by the next group.
     }
     finish_scan_io(file, initial_bytes, initial_calls, result);
     add_elapsed(options.timing, execution_start, result.timing.execution_ms);
     if (digest) {
         result.row_digest = digest->finish();
+        result.verification = digest->summaries();
+        result.verification.resize(selection.projection_indices.size());
     }
     return result;
 }

@@ -26,6 +26,9 @@ inline void add_elapsed(bool enabled, Clock::time_point start, double& total) {
 
 struct ScanTiming {
     double planning_ms = 0, read_ms = 0, allocation_ms = 0;
+    // Nested decode stages; these are included in decode_ms, not additional time.
+    double page_header_ms = 0, checksum_ms = 0, index_decode_ms = 0, gather_ms = 0;
+    double index_allocation_ms = 0;
     double decode_ms = 0, filter_ms = 0, execution_ms = 0;
 };
 } // namespace parquetscope

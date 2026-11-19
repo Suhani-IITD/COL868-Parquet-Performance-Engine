@@ -3,28 +3,28 @@
 #include <span>
 #include <string>
 #include <vector>
+#include <optional>
 
-struct evp_md_ctx_st;
 namespace parquetscope {
+struct ValueSummary {
+    uint64_t count = 0, sum_modulo_64 = 0;
+    std::optional<int64_t> minimum, maximum;
+};
 
-// SHA256 over row-major signed values, encoded as eight little-endian bytes each.
-// This optional validation digest does not encode column schema or row count.
+// Optional correctness fingerprint: FNV-1a-64 over row-major little-endian INT64.
+// Non-cryptographic; combine with counts/column summaries and independent row checks.
 class ValueDigest {
 public:
-    // Initialize the SHA256 context, or throw if allocation/initialization fails.
-    ValueDigest();
-    // Release the owned OpenSSL context.
-    ~ValueDigest();
-    ValueDigest(const ValueDigest&) = delete;
-    ValueDigest& operator=(const ValueDigest&) = delete;
-    // Append one projected row to the digest; scratch storage is reused across rows.
+    // Update the hash and per-column summaries with one projected row.
     void row(std::span<const int64_t> values);
-    // Finalize once and return a hexadecimal SHA256 string.
+    // Finalize once and return 16 lowercase hexadecimal digits.
     std::string finish();
-
+    // Borrow per-column counts, modulo-2^64 sums and signed extrema.
+    const std::vector<ValueSummary>& summaries() const { return summaries_; }
 private:
-    evp_md_ctx_st* context_ = nullptr;
-    std::vector<uint8_t> bytes_;
+    uint64_t hash_ = 14695981039346656037ull;
     bool finished_ = false;
+    bool initialized_ = false;
+    std::vector<ValueSummary> summaries_;
 };
 } // namespace parquetscope

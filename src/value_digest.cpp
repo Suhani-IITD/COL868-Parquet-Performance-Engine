@@ -1,56 +1,41 @@
 #include "parquetscope/value_digest.hpp"
-#include <openssl/evp.h>
-#include <limits>
 #include <stdexcept>
 
 namespace parquetscope {
-
-// Allocate and initialize the owned SHA256 context.
-ValueDigest::ValueDigest() {
-    context_ = EVP_MD_CTX_new();
-    if (!context_ || EVP_DigestInit_ex(context_, EVP_sha256(), nullptr) != 1) {
-        EVP_MD_CTX_free(context_);
-        throw std::runtime_error("SHA256 initialization failed");
-    }
-}
-
-// Release the context whether or not finish() was called.
-ValueDigest::~ValueDigest() {
-    EVP_MD_CTX_free(context_);
-}
-
-// Encode one row deterministically and append its bytes to the running digest.
+// Encode signed values without overflow and update an order-sensitive fingerprint.
 void ValueDigest::row(std::span<const int64_t> values) {
-    if (finished_ || values.size() > std::numeric_limits<size_t>::max() / 8) {
+    if (finished_) {
         throw std::runtime_error("invalid digest update");
     }
-    bytes_.resize(values.size() * 8);
-    for (size_t index = 0; index < values.size(); ++index) {
-        for (size_t byte = 0; byte < 8; ++byte) {
-            bytes_[index * 8 + byte] = static_cast<uint8_t>(uint64_t(values[index]) >> (8 * byte));
-        }
+    if (!initialized_) {
+        summaries_.resize(values.size());
+        initialized_ = true;
     }
-    if (EVP_DigestUpdate(context_, bytes_.data(), bytes_.size()) != 1) {
-        throw std::runtime_error("SHA256 update failed");
+    if (values.size() != summaries_.size()) {
+        throw std::runtime_error("digest row width changed");
+    }
+    for (size_t column = 0; column < values.size(); ++column) {
+        const auto value = values[column];
+        auto& summary = summaries_[column];
+        ++summary.count;
+        summary.sum_modulo_64 += static_cast<uint64_t>(value);
+        if (!summary.minimum || value < *summary.minimum) { summary.minimum = value; }
+        if (!summary.maximum || value > *summary.maximum) { summary.maximum = value; }
+        for (unsigned byte = 0; byte < 8; ++byte) {
+            hash_ ^= static_cast<uint8_t>(static_cast<uint64_t>(value) >> (8 * byte));
+            hash_ *= 1099511628211ull;
+        }
     }
 }
 
-// Finish the hash and return its hexadecimal text; reject repeated finalization.
+// Format the final FNV-1a state; repeated finalization is a caller error.
 std::string ValueDigest::finish() {
-    if (finished_) {
-        throw std::runtime_error("digest already finalized");
-    }
-    unsigned char bytes[EVP_MAX_MD_SIZE];
-    unsigned length = 0;
-    if (EVP_DigestFinal_ex(context_, bytes, &length) != 1 || length != 32) {
-        throw std::runtime_error("SHA256 finish failed");
-    }
+    if (finished_) { throw std::runtime_error("digest already finalized"); }
     finished_ = true;
-    constexpr char hex_digits[] = "0123456789abcdef";
-    std::string result;
-    for (unsigned index = 0; index < length; ++index) {
-        result += hex_digits[bytes[index] >> 4];
-        result += hex_digits[bytes[index] & 15];
+    constexpr char digits[] = "0123456789abcdef";
+    std::string result(16, '0');
+    for (unsigned digit = 0; digit < 16; ++digit) {
+        result[15 - digit] = digits[(hash_ >> (digit * 4)) & 15];
     }
     return result;
 }
