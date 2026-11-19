@@ -104,15 +104,18 @@ def main():
 
         feature_subset = [r for r in predicted if r.get("est_packed") != "" and r.get("act_packed") is not None]
         if feature_subset:
-            print("## Feature accuracy: metadata estimates vs decoded values (median error)\n")
+            print("## Feature accuracy: metadata estimates vs decoded values\n")
+            print("Errors are a share of all dictionary-encoded values, so they stay meaningful when a count is 0.\n")
             f_body = []
             for order in orders:
                 order_runs = [r for r in feature_subset if r["order"] == order and r["encoding"] == "dict"]
                 if not order_runs:
                     continue
-                p_err = [abs(r["est_packed"] - r["act_packed"]) / max(1.0, r["act_packed"]) for r in order_runs]
-                r_err = [abs(r["est_rle"] - r["act_rle"]) / max(1.0, r["act_rle"]) for r in order_runs]
-                f_body.append([order, len(order_runs), f"{statistics.median(p_err):.1%}", f"{statistics.median(r_err):.1%}"])
+                totals = [max(1.0, r["act_packed"] + r["act_rle"]) for r in order_runs]
+                p_err = [abs(r["est_packed"] - r["act_packed"]) / t for r, t in zip(order_runs, totals, strict=True)]
+                r_err = [abs(r["est_rle"] - r["act_rle"]) / t for r, t in zip(order_runs, totals, strict=True)]
+                f_body.append([order, len(order_runs), f"{statistics.median(p_err):.1%}",
+                               f"{statistics.median(r_err):.1%}"])
             if f_body:
                 print(table(["order", "n", "bit-packed error", "rle error"], f_body))
 

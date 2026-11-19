@@ -286,8 +286,8 @@ CostPrediction predict_cost(const CostModel& model, const CostFeatures& features
         model.dictionary_chunk_ms * features.dictionary_chunks;
     prediction.filter_ms = model.filter_row_ms * features.predicate_rows;
     prediction.overhead_ms = model.fixed_ms;
-    prediction.total_ms = prediction.planning_ms + prediction.read_ms + prediction.decode_ms +
-        prediction.filter_ms + prediction.overhead_ms;
+    // Matches the scan's execution time, which starts after planning; planning is reported separately.
+    prediction.total_ms = prediction.read_ms + prediction.decode_ms + prediction.filter_ms + prediction.overhead_ms;
     return prediction;
 }
 
@@ -414,13 +414,14 @@ nlohmann::json model_to_json(const CostModel& model) {
     return json;
 }
 
-// Deserialize cost model coefficients from JSON.
+// Deserialize cost model coefficients from JSON; a missing coefficient means an incompatible model file.
 CostModel model_from_json(const nlohmann::json& json) {
     CostModel model;
     for (const auto& [name, field] : model_fields) {
-        if (json.contains(name)) {
-            model.*field = json.at(name).get<double>();
+        if (!json.contains(name)) {
+            throw std::runtime_error(std::string("model file lacks ") + name + "; re-run calibrate");
         }
+        model.*field = json.at(name).get<double>();
     }
     if (json.contains("environment") && json["environment"].is_object()) {
         const auto& env = json["environment"];
