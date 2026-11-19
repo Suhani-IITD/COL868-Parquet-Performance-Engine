@@ -20,8 +20,11 @@ namespace parquetscope {
 namespace {
 using Matrix = std::vector<std::vector<double>>;
 
-constexpr std::array<std::pair<const char*, double CostModel::*>, 13> model_fields{{
+constexpr std::array<std::pair<const char*, double CostModel::*>, 18> model_fields{{
     {"fixed_ms", &CostModel::fixed_ms},
+    {"planning_start_ms", &CostModel::planning_start_ms},
+    {"footer_byte_ms", &CostModel::footer_byte_ms},
+    {"group_col_ms", &CostModel::group_col_ms},
     {"read_start_ms", &CostModel::read_start_ms},
     {"chunk_ms", &CostModel::chunk_ms},
     {"byte_ms", &CostModel::byte_ms},
@@ -33,6 +36,8 @@ constexpr std::array<std::pair<const char*, double CostModel::*>, 13> model_fiel
     {"packed_dict_mb_ms", &CostModel::packed_dict_mb_ms},
     {"rle_value_ms", &CostModel::rle_value_ms},
     {"output_buffer_byte_ms", &CostModel::output_buffer_byte_ms},
+    {"dictionary_entry_ms", &CostModel::dictionary_entry_ms},
+    {"dictionary_chunk_ms", &CostModel::dictionary_chunk_ms},
     {"filter_row_ms", &CostModel::filter_row_ms},
 }};
 
@@ -47,10 +52,15 @@ void add_chunk_features(const Chunk& chunk, CostFeatures& features) {
         return;
     }
     const uint64_t width = chunk.physical_type == "INT32" ? 4 : 8;
-    const auto dictionary_bytes = static_cast<uint64_t>(*chunk.data_offset - *chunk.dictionary_offset);
+    // Thrift dictionary page headers take roughly 12 bytes; subtract this so entry count is not inflated.
+    constexpr uint64_t estimated_dict_header_bytes = 12;
+    const auto raw_dict_bytes = static_cast<uint64_t>(*chunk.data_offset - *chunk.dictionary_offset);
+    const auto dictionary_bytes = raw_dict_bytes > estimated_dict_header_bytes
+        ? raw_dict_bytes - estimated_dict_header_bytes
+        : raw_dict_bytes;
     const auto entries = std::max<uint64_t>(1, dictionary_bytes / width);
     const auto bits = static_cast<double>(std::bit_width(entries - 1));
-    const auto data_bytes = static_cast<double>(static_cast<uint64_t>(*chunk.compressed_size) - dictionary_bytes);
+    const auto data_bytes = static_cast<double>(static_cast<uint64_t>(*chunk.compressed_size) - raw_dict_bytes);
     const double packed_bytes = values * bits / 8;
     double plain = 0, packed = 0;
     if (data_bytes >= packed_bytes) {
@@ -58,13 +68,23 @@ void add_chunk_features(const Chunk& chunk, CostFeatures& features) {
         plain = saving > 0 ? std::clamp((data_bytes - packed_bytes) / saving, 0.0, values) : 0.0;
         packed = values - plain;
     } else if (bits > 0) {
-        packed = data_bytes * 8 / bits;
+        // Accounting for minimum RLE header overhead (~2 bytes per run, averaging ~10 values per run)
+        const double rle_byte_rate = std::max(0.1, std::ceil(bits / 8.0) / 10.0);
+        const double packed_byte_rate = bits / 8.0;
+        if (packed_byte_rate > rle_byte_rate) {
+            packed = std::clamp((data_bytes - values * rle_byte_rate) / (packed_byte_rate - rle_byte_rate), 0.0, values);
+        } else {
+            packed = std::clamp(data_bytes * 8 / bits, 0.0, values);
+        }
     }
+    const double rle = std::max(0.0, values - plain - packed);
     features.plain_values += plain;
     features.packed_values += packed;
     features.packed_bits += packed * bits;
     features.packed_dict_mb += packed * static_cast<double>(dictionary_bytes) / 1e6;
-    features.rle_values += values - plain - packed;
+    features.rle_values += rle;
+    features.dictionary_entries += static_cast<double>(entries);
+    features.dictionary_chunks += 1.0;
 }
 
 // Gaussian elimination with partial pivoting; false when the system is singular.
@@ -138,6 +158,7 @@ std::vector<double> fit_nonnegative(const Matrix& x, const std::vector<double>& 
     return best;
 }
 
+// Return the median value from a set of timing samples.
 double median(std::vector<double> values) {
     const auto middle = values.begin() + static_cast<std::ptrdiff_t>(values.size() / 2);
     std::nth_element(values.begin(), middle, values.end());
@@ -192,6 +213,7 @@ Sample measure(const std::string& path, std::vector<std::string> args, CostFeatu
         return median(std::move(values));
     };
     Sample sample{features, {}};
+    sample.timing.planning_ms = stage("planning");
     sample.timing.read_ms = stage("read");
     sample.timing.decode_ms = stage("decode");
     sample.timing.filter_ms = stage("filter");
@@ -200,9 +222,12 @@ Sample measure(const std::string& path, std::vector<std::string> args, CostFeatu
 }
 } // namespace
 
+// Extract metadata-derived query cost features without reading any data pages.
 CostFeatures extract_features(const Metadata& metadata, const Plan& plan) {
     CostFeatures features;
     double largest_group_rows = 0;
+    features.footer_bytes = static_cast<double>(metadata.footer_length);
+    features.groups_columns = static_cast<double>(plan.groups.size() * plan.required_columns.size());
     for (const auto& group : plan.groups) {
         if (!group.retained) { continue; }
         ++features.groups;
@@ -220,26 +245,30 @@ CostFeatures extract_features(const Metadata& metadata, const Plan& plan) {
     return features;
 }
 
+// Predict planning, read, decode, filter, and overhead latency from features.
 CostPrediction predict_cost(const CostModel& model, const CostFeatures& features) {
     CostPrediction prediction;
     // Start-up terms apply once a stage runs at all; a fully pruned query reads nothing.
     const double runs = features.chunks > 0 ? 1.0 : 0.0;
+    prediction.planning_ms = runs * model.planning_start_ms + model.footer_byte_ms * features.footer_bytes +
+        model.group_col_ms * features.groups_columns;
     prediction.read_ms = runs * model.read_start_ms + model.byte_ms * features.bytes +
         model.chunk_ms * features.chunks + model.raw_buffer_byte_ms * features.raw_buffer_bytes;
     prediction.decode_ms = runs * model.decode_start_ms + model.plain_value_ms * features.plain_values +
         model.packed_value_ms * features.packed_values + model.packed_bit_ms * features.packed_bits +
         model.packed_dict_mb_ms * features.packed_dict_mb + model.rle_value_ms * features.rle_values +
-        model.output_buffer_byte_ms * features.output_buffer_bytes;
+        model.output_buffer_byte_ms * features.output_buffer_bytes +
+        model.dictionary_entry_ms * features.dictionary_entries +
+        model.dictionary_chunk_ms * features.dictionary_chunks;
     prediction.filter_ms = model.filter_row_ms * features.predicate_rows;
     prediction.overhead_ms = model.fixed_ms;
-    prediction.total_ms = prediction.read_ms + prediction.decode_ms + prediction.filter_ms + prediction.overhead_ms;
+    prediction.total_ms = prediction.planning_ms + prediction.read_ms + prediction.decode_ms +
+        prediction.filter_ms + prediction.overhead_ms;
     return prediction;
 }
 
 // Scan every supported column whole, with and without an always-true predicate, plus all columns
-// together; then fit each
-// stage separately: read ~ bytes, chunks and raw buffer; decode ~ values, ID bits and output
-// buffers; filter ~ rows.
+// together; then fit each stage separately.
 CostModel calibrate(std::span<const std::string> paths, int repeats) {
     std::vector<Sample> samples;
     for (const auto& path : paths) {
@@ -272,13 +301,15 @@ CostModel calibrate(std::span<const std::string> paths, int repeats) {
     }
     if (samples.empty()) { throw std::invalid_argument("calibration files have no scannable columns"); }
 
-    Matrix read_x, decode_x, filter_x, fixed_x;
-    std::vector<double> read_y, decode_y, filter_y, fixed_y;
+    Matrix planning_x, read_x, decode_x, filter_x, fixed_x;
+    std::vector<double> planning_y, read_y, decode_y, filter_y, fixed_y;
     for (const auto& [f, t] : samples) {
+        planning_x.push_back({1.0, f.footer_bytes, f.groups_columns});
+        planning_y.push_back(t.planning_ms);
         read_x.push_back({1.0, f.bytes, f.chunks, f.raw_buffer_bytes});
         read_y.push_back(t.read_ms);
         decode_x.push_back({1.0, f.plain_values, f.packed_values, f.packed_bits, f.packed_dict_mb, f.rle_values,
-                            f.output_buffer_bytes});
+                            f.output_buffer_bytes, f.dictionary_entries, f.dictionary_chunks});
         decode_y.push_back(t.decode_ms);
         if (f.predicate_rows > 0) {
             filter_x.push_back({f.predicate_rows});
@@ -287,10 +318,14 @@ CostModel calibrate(std::span<const std::string> paths, int repeats) {
         fixed_x.push_back({1.0});
         fixed_y.push_back(std::max(0.0, t.execution_ms - t.read_ms - t.decode_ms - t.filter_ms));
     }
+    const auto planning = fit_nonnegative(planning_x, planning_y);
     const auto read = fit_nonnegative(read_x, read_y);
     const auto decode = fit_nonnegative(decode_x, decode_y);
     const auto filter = fit_nonnegative(filter_x, filter_y);
     CostModel model;
+    model.planning_start_ms = planning[0];
+    model.footer_byte_ms = planning[1];
+    model.group_col_ms = planning[2];
     model.read_start_ms = read[0];
     model.byte_ms = read[1];
     model.chunk_ms = read[2];
@@ -302,23 +337,28 @@ CostModel calibrate(std::span<const std::string> paths, int repeats) {
     model.packed_dict_mb_ms = decode[4];
     model.rle_value_ms = decode[5];
     model.output_buffer_byte_ms = decode[6];
+    model.dictionary_entry_ms = decode[7];
+    model.dictionary_chunk_ms = decode[8];
     model.filter_row_ms = filter.empty() ? 0.0 : filter[0];
     model.fixed_ms = fit_nonnegative(fixed_x, fixed_y)[0];
     return model;
 }
 
+// Serialize cost model coefficients to JSON.
 nlohmann::json model_to_json(const CostModel& model) {
     nlohmann::json json;
     for (const auto& [name, field] : model_fields) { json[name] = model.*field; }
     return json;
 }
 
+// Deserialize cost model coefficients from JSON.
 CostModel model_from_json(const nlohmann::json& json) {
     CostModel model;
     for (const auto& [name, field] : model_fields) { model.*field = json.at(name).get<double>(); }
     return model;
 }
 
+// Format cost prediction and feature breakdown into structured JSON output.
 nlohmann::json prediction_to_json(const Plan& plan, const CostFeatures& features,
                                   const CostPrediction& prediction) {
     return {
@@ -329,11 +369,15 @@ nlohmann::json prediction_to_json(const Plan& plan, const CostFeatures& features
                       {"predicate_rows", features.predicate_rows}, {"plain_values", features.plain_values},
                       {"packed_values", features.packed_values}, {"packed_bits", features.packed_bits},
                       {"packed_dict_mb", features.packed_dict_mb}, {"rle_values", features.rle_values},
+                      {"dictionary_entries", features.dictionary_entries},
+                      {"dictionary_chunks", features.dictionary_chunks},
                       {"raw_buffer_bytes", features.raw_buffer_bytes},
-                      {"output_buffer_bytes", features.output_buffer_bytes}}},
-        {"predicted_ms", {{"read", prediction.read_ms}, {"decode", prediction.decode_ms},
-                          {"filter", prediction.filter_ms}, {"overhead", prediction.overhead_ms},
-                          {"total", prediction.total_ms}}},
+                      {"output_buffer_bytes", features.output_buffer_bytes},
+                      {"footer_bytes", features.footer_bytes},
+                      {"groups_columns", features.groups_columns}}},
+        {"predicted_ms", {{"planning", prediction.planning_ms}, {"read", prediction.read_ms},
+                          {"decode", prediction.decode_ms}, {"filter", prediction.filter_ms},
+                          {"overhead", prediction.overhead_ms}, {"total", prediction.total_ms}}},
         {"note", "Metadata-only estimate; no data pages were read."}};
 }
 
